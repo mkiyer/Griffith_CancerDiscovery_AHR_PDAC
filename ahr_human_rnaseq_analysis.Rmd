@@ -1,0 +1,1088 @@
+---
+title: "rnaseq frankel smoking study"
+output: html_document
+date: "2024-01-08"
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(ggrepel)
+library(patchwork)
+library(pheatmap)
+library(arrow)
+
+# bioconductor
+library(limma)
+library(edgeR)
+library(factoextra)
+library(msigdbr)
+library(fgsea)
+library(babelgene)
+
+```
+
+## Input files
+
+```{r input files}
+
+# Directories
+working_dir <- "/Users/mkiyer/Dropbox (University of Michigan)/research/projects/frankel_smoking"
+data_dir <- file.path(working_dir, "data")
+results_dir <- file.path(working_dir, "results")
+plot_dir <- file.path(results_dir, "plots")
+knitr::opts_knit$set(root.dir = working_dir)
+
+# create output directories
+for (d in c(working_dir, results_dir, plot_dir)) {
+  if (!dir.exists(d)) {
+    dir.create(d)
+  }
+}
+
+#
+# Input files
+#
+# sample sheet
+sample_xlsx_file <- file.path(data_dir, "libs.xlsx")
+# analysis metadata
+analysis_meta_file <- file.path(data_dir, "meta.tsv")
+# count data
+star_sj_count_file <- file.path(data_dir, "star_sj_counts.feather")
+star_gene_count_file <- file.path(data_dir, "star_gene_counts.feather")
+# gene annotation
+gene_annotation_gtf <- file.path(data_dir, "gencodedb", "genes.tsv.gz")
+
+#
+# external data
+#
+# ahr signature
+ahr_signature_xlsx_file <- file.path(data_dir, "ahr_signature_opitz_cell_2020.xlsx")
+# orthotopic tcdd de results
+orthotopic_tcdd_de_xlsx_file <- "/Users/mkiyer/Dropbox (University of Michigan)/TCDD Orthotopic scRNA-seq/mkiyer_ahr_signaling_results/de_results.xlsx"
+
+#
+# Input parameters
+#
+# min number of sj reads per sample
+sample_min_counts_sj <- 1e6
+# mitochondrial frac cutoff
+sample_mt_frac_threshold <- 0.25
+# intergenic frac cutoff
+sample_intergenic_frac_threshold <- 0.25
+
+# gene filtering parameters
+gene_min_counts <- 10
+gene_min_prop <- 0.1
+gene_min_samples <- 2
+gene_min_studies <- 2
+
+# splice junction filtering
+sj_min_counts <- 2
+sj_min_prop <- 0
+sj_min_samples <- 2
+sj_min_studies <- 2
+
+# normalization
+norm_method <- "TMM"
+log2_pseudocount <- 1
+
+# de parameters
+de_padj_cutoff <- 0.05
+de_log2fc_cutoff <- 1
+
+# color scales for plots
+color_scales = list(
+  smoking_type = c(cigarette="#dd0000", ecigarette="#ffcc00", control="#0000cc")
+)
+
+```
+
+## Read published AHR gene signature and convert to mouse
+
+```{r ahr signature read, include=FALSE}
+
+# AHR signature (human gene symbols)
+ahr_opitz_cell_human_genes <- read_xlsx(ahr_signature_xlsx_file)
+ahr_opitz_cell_human_genes <- ahr_opitz_cell_human_genes %>% pull(Gene)
+# literature curated ahr signaling genes
+ahr_literature_genes <- c("CYP1A1", "CYP1B1", "TIPARP", "AHRR", "THBS1")
+
+```
+
+## Read orthotopic TCDD de results
+
+```{r read orthotopic tcdd results, include=FALSE}
+
+orthotopic_tcdd_de <- read_xlsx(orthotopic_tcdd_de_xlsx_file)
+orthotopic_tcdd_de <- dplyr::rename(orthotopic_tcdd_de, mouse_gene = gene)
+
+# convert mouse to human genes
+x <- orthologs(orthotopic_tcdd_de$mouse_gene, species="mouse", human=FALSE)
+x <- dplyr::select(x, gene=human_symbol, mouse_gene=symbol)
+x <- dplyr::left_join(orthotopic_tcdd_de, x, join_by(mouse_gene == mouse_gene),
+                      multiple="any")
+dim(x)
+# filter human genes that are 'NA'
+orthotopic_tcdd_de <- filter(x, !is.na(gene))
+dim(orthotopic_tcdd_de)
+
+# make gene sets
+orthotopic_tcdd_gs <- list()
+x <- orthotopic_tcdd_de %>% 
+  filter(ident == "All_cells", 
+         p_val_adj < 1e-100,
+         avg_log2FC > 1)
+orthotopic_tcdd_gs$ORTHOTOPIC_TCDD_ALL_CELLS_UP <- pull(x, gene)
+
+x <- orthotopic_tcdd_de %>% 
+  filter(ident == "All_cells", 
+         p_val_adj < 1e-100,
+         avg_log2FC < -1)
+orthotopic_tcdd_gs$ORTHOTOPIC_TCDD_ALL_CELLS_DN <- pull(x, gene)
+
+```
+
+## Functions
+
+```{r helper functions}
+
+read_sample_table <- function(xlsx_file, meta_file) {
+  # sample information
+  samples <- read_xlsx(xlsx_file, guess_max = 1e6)
+  # analysis metadata
+  x <- read_tsv(meta_file, guess_max=1e6)
+  # join (only keep rows with valid analysis)
+  samples <- inner_join(samples, x, by=c("library"="lib"))
+  # a few duplicate runs still exist, these could be technical
+  # replicates not explicitly annotated as such
+  samples %>% 
+    select(study, patient, sample, library, `Uniquely mapped reads number`) %>%
+    group_by(library) %>%
+    filter(n() >= 2) %>%
+    ungroup() %>%
+    distinct()
+  # for now, merge these duplicates
+  samples <- samples %>%
+    group_by(library) %>%
+    slice_head() %>%
+    ungroup()
+  # create globally unique patient/sample identifiers
+  samples <- samples %>%
+    mutate(
+      patient_uid = paste0(study, "_", patient),
+      sample_uid = paste0(study, "_", patient, "_", sample)
+    )
+}
+
+merge_to_gene_symbol <- function(meta, y) {
+  # merge duplicate gene ids/names by selecting duplicate gene with greater avg
+  meta <- meta %>% 
+    mutate(avgexpr = rowMeans(y)) %>%
+    group_by(gene_name) %>%
+    slice_max(avgexpr, n=1) %>%
+    ungroup()
+  return(meta)
+}
+
+# checks that gene has min of min.counts in at least min.prop of samples
+# returns vector of true/false for each gene
+filter_expr_group <- function(x, min.counts=10, min.prop=0.1, min.samples=2) {
+  nsamples <- max(min.samples, round(min.prop * ncol(x)))
+  keep <- rowSums(x > min.counts) >= nsamples
+  return(keep)
+}
+
+# counts number of independent datasets where there is expression
+calc_num_studies <- function(s, x, min_counts) {
+  studies = list()
+  for (my_study in unique(s$study)) {
+    libs <- s %>% filter(study == my_study) %>% pull(library)
+    print(paste(my_study, length(libs)))
+    studies[[my_study]] <- filter_expr_group(x[, libs], min.counts=min_counts)
+  }
+  studies <- bind_cols(studies)
+  num_studies <- apply(studies, 1, sum)
+  return(num_studies)
+}
+
+
+## Functions: PCA
+
+run_pca <- function(x, npcs=50) {
+  pca <- prcomp(t(x), rank.=npcs)
+  pct_var <- round(100 * pca$sdev^2 / sum( pca$sdev^2 ), 2)
+  pct_var <- paste(colnames(pca$x), " (", paste(as.character(pct_var), "%", ")", sep=""), sep="")
+  return(list(pca = pca, pct_var = pct_var))
+}
+
+pca_plot <- function(pca_res, pca_tbl, color_by, shape_by) {
+  p <- ggplot(pca_tbl, aes(x=PC1, y=PC2, color={{color_by}}, shape={{shape_by}})) +
+    geom_point(alpha = 0.8, size=2) +
+    theme_bw() +
+    labs(x=pca_res$pct_var[1], y=pca_res$pct_var[2])
+  return(p)
+}
+
+
+## Filtering genes
+
+get_filtered_subset <- function(y, min.expr = 1, min.prop = 0.2) {
+  min.samples <- round(min.prop * ncol(y))
+  keep = rowSums(y >= min.expr) >= min.samples
+  return(y[keep,])
+}
+
+
+## Functions: plotting
+
+
+plot_crazy_de_volcano <- function(res, nlabel=50) {
+  # label the top n up/down genes
+  label_data <- bind_rows(filter(res, de == "up") %>% slice_max(log2fc, n=nlabel),
+                          filter(res, de == "dn") %>% slice_min(log2fc, n=nlabel))
+  label_data <- distinct(label_data)
+  ymin <- 0
+  ymax <- max(-log10(res$padj+1e-300)) + 50
+  xmin <- -max(res$log2fc) - 0.5
+  xmax <- max(res$log2fc) + 0.5
+
+  p <- ggplot(res, aes(x=log2fc, y=-log10(padj+1e-300), color=de, size=de)) +
+    geom_point(alpha=0.7) +
+    geom_text_repel(data=label_data, color="black", size=3, aes(label=gene), max.overlaps=Inf) +
+    ylim(ymin, ymax) +
+    xlim(xmin, xmax) +
+    scale_color_manual(values=c("no"="grey", "dn"="blue", "up"="red")) +
+    scale_size_manual(values=c("no"=1, "dn"=2, "up"=2)) +
+    theme_minimal() +
+    theme(legend.position="bottom") +
+    theme(axis.line = element_line(color = "black")) +
+    labs(x="log2fc", y="-log10(padj)")
+  return(p)
+}
+
+
+save_pheatmap_pdf <- function(x, filename, width=7, height=7) {
+  stopifnot(!missing(x))
+  stopifnot(!missing(filename))
+  pdf(filename, width=width, height=height)
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()
+}
+
+
+plot_de_scatter2d <- function(tbl, xcontrast, ycontrast, nlabel=10, 
+                              highlight_genes=NULL) {
+  if (is.null(highlight_genes)) {
+    highlight_genes <- c()
+  }
+  xde <- sym(paste0("de_", xcontrast))
+  yde <- sym(paste0("de_", ycontrast))
+  xlog2fc <- sym(paste0("log2fc_", xcontrast))
+  ylog2fc <- sym(paste0("log2fc_", ycontrast))
+
+  x <- tbl %>% 
+    mutate(subtype = paste0("x", {{xde}}, "_", "y", {{yde}}),
+           log2fc_abs_x = case_when({{xde}} == "no" ~ 0,
+                                    TRUE ~ abs({{xlog2fc}})),
+           log2fc_abs_y = case_when({{yde}} == "no" ~ 0,
+                                    TRUE ~ abs({{ylog2fc}})),
+           log2fc_abs_max = pmax(log2fc_abs_x, log2fc_abs_y))
+  
+  color_scale = c(xno_yno = "#888888",
+                  xup_yup = "#FF0000",
+                  xdn_ydn = "#0000aa",
+                  xup_ydn = "#eeee00",
+                  xdn_yup = "#ff00ff",
+                  xup_yno = "#32cd32",
+                  xdn_yno = "#670092",
+                  xno_yup = "#ff6700",
+                  xno_ydn = "#16ccc4")
+  size_scale = c(xno_yno = 1, 
+                 xup_yup = 2,
+                 xdn_ydn = 2,
+                 xup_ydn = 2,
+                 xdn_yup = 2,
+                 xup_yno = 2,
+                 xdn_yno = 2,
+                 xno_yup = 2,
+                 xno_ydn = 2)
+  
+  annot_data <- filter(x, subtype != "xno_yno")
+  none_data <- filter(x, subtype == "xno_yno")
+  label_data <- annot_data %>% 
+    group_by(subtype) %>%
+    slice_max(log2fc_abs_max, n=nlabel) %>%
+    ungroup()
+  highlight_data <- filter(x, gene %in% highlight_genes)
+
+  p <- ggplot(x, aes(x={{xlog2fc}}, 
+                     y={{ylog2fc}},
+                     color=subtype, 
+                     size=subtype)) +
+    geom_point(data=none_data, alpha=0.4) + 
+    geom_point(data=annot_data, alpha=0.8) +
+    geom_text_repel(data=label_data, color="black", size=3, aes(label=gene), max.overlaps=Inf) + 
+    geom_point(data=highlight_data, pch=21, fill=NA, size=5, colour="#ffff00", stroke=1) + 
+    geom_point(data=highlight_data, pch=21, fill=NA, size=4, colour="#222222", stroke=1, alpha=0.5) +
+    geom_text_repel(data=highlight_data, color="black", size=3, aes(label=gene), max.overlaps=Inf) +     
+    scale_color_manual(values = color_scale) +
+    scale_size_manual(values = size_scale, guide = "none") + 
+    theme_minimal() +
+    xlab(rlang::as_string(xlog2fc)) +
+    ylab(rlang::as_string(ylog2fc)) +
+    labs(color = "DE Genes")
+  return(p)
+}
+
+get_top_gene_sets <- function(tbl, log2fc_cutoff, padj_cutoff) {
+  ntopgenes <- c(20, 50, 100, 200, 500)
+  gs <- list()
+  for (a in unique(tbl$analysis)) {
+    up_genes <- tbl %>% filter(
+      analysis == a,
+      log2fc >= log2fc_cutoff,
+      fdr < padj_cutoff
+    )
+    dn_genes <- tbl %>% filter(
+      analysis == a,
+      log2fc <= -log2fc_cutoff,
+      fdr < padj_cutoff
+    )
+    gs_name <- paste0(toupper(a), "_ALL_UP")
+    gs[[gs_name]] <- pull(up_genes, gene_symbol)
+    gs_name <- paste0(toupper(a), "_ALL_DN")
+    gs[[gs_name]] <- pull(dn_genes, gene_symbol)
+
+    for (n in ntopgenes) {
+      x <- up_genes %>% slice_max(log2fc, n=n) %>% pull(gene_symbol)
+      if (length(x) < n) { next }
+      gs_name <- paste0(toupper(a), "_TOP", n, "_UP")
+      gs[[gs_name]] <- x
+      
+      x <- dn_genes %>% slice_min(log2fc, n=n) %>% pull(gene_symbol)
+      if (length(x) < n) { next }
+      gs_name <- paste0(toupper(a), "_TOP", n, "_DN")
+      gs[[gs_name]] <- x 
+    }
+  }
+  return(gs)
+}
+
+```
+
+
+## Read data
+
+```{r read data, include=FALSE}
+
+# read samples
+samples <- read_sample_table(sample_xlsx_file, analysis_meta_file)
+# subset smoking studies
+smoking_studies = c("ad_smoking", "st_smoking")
+samples <- samples %>% filter(study %in% smoking_studies)
+
+# read gene metadata
+gene_meta <- read_tsv(gene_annotation_gtf, guess_max=1e6)
+gene_meta <- gene_meta %>% arrange(gene_id)
+
+# splice junctions
+sjm <- read_feather(star_sj_count_file)
+sjm <- as_tibble(sjm) %>% column_to_rownames("gene_id") %>% collect()
+
+# gene counts
+gm <- read_feather(star_gene_count_file)
+gm <- as_tibble(gm) %>% column_to_rownames("gene_id") %>% collect()
+
+# ensure count matrices contain the same samples
+stopifnot(setequal(colnames(sjm), colnames(gm)))
+
+# filter samples that have count data
+samples_with_data <- intersect(samples$library, colnames(sjm))
+samples <- samples %>% filter(library %in% samples_with_data)
+
+# ensure count data is aligned with samples
+sjm <- sjm[, samples$library]
+gm <- gm[, samples$library]
+stopifnot(all(colnames(sjm) == samples$library))
+stopifnot(all(colnames(gm) == samples$library))
+stopifnot(all(colnames(sjm) == colnames(gm)))
+
+# ensure count data is aligned with genes
+stopifnot(all(gene_meta$gene_id == rownames(gm)))
+stopifnot(all(gene_meta$gene_id == rownames(sjm)))
+
+```
+
+## QC metrics
+
+```{r qc, include=FALSE}
+
+calc_sample_qc_metrics <- function(sjx, gx) {
+  # total sj and gene counts
+  tot_counts <- colSums(gx)
+  tot_counts_sj <- colSums(sjx)
+  frac_counts_sj <- tot_counts_sj / tot_counts
+
+  # complexity is unique count values
+  complexity = apply(gm, 2, function(x) length(unique(x))) / nrow(gm)
+  complexity_sj = apply(sjm, 2, function(x) length(unique(x))) / nrow(sjm)
+
+  # fraction of genes expression expressed at zero or very low levels
+  low_expr_frac <- apply(gm, 2, function(x) { 
+    low_threshold <- max(gene_min_counts, 1e-6 * sum(x))
+    return(mean(x < low_threshold))
+  })
+  low_expr_frac_sj <- apply(sjm, 2, function(x) { 
+    low_threshold <- max(sj_min_counts, 1e-6 * sum(x))
+    return(mean(x < low_threshold))
+  })
+
+  # mitochondrial
+  mt_genes <- gene_meta %>% filter(chrom == "chrM") %>% pull(gene_id)
+  mt_frac <- colSums(gm[mt_genes,]) / tot_counts
+
+  # add sample cols
+  return(tibble(
+    tot_counts = tot_counts,
+    tot_counts_sj = tot_counts_sj,
+    frac_counts_sj = frac_counts_sj,
+    complexity = complexity,
+    complexity_sj = complexity_sj,
+    low_expr_frac = low_expr_frac,
+    low_expr_frac_sj = low_expr_frac_sj,
+    mt_frac = mt_frac
+  ))
+}
+
+x <- calc_sample_qc_metrics(sjm, gm)
+samples <- bind_cols(samples, x)
+
+```
+
+# QC plots
+
+```{r qc plots}
+
+plot_qc_boxplot <- function(x, aes_x, aes_y, aes_fill) {
+  p <- ggplot(x, aes(x=reorder({{aes_x}}, {{aes_y}}), y={{aes_y}}, fill={{aes_fill}})) +
+    geom_boxplot(outlier.shape=NA, width=0.5) +
+    geom_point(aes(group={{aes_fill}}), pch=21, alpha=0.8, size=1,
+               position=position_jitterdodge(dodge.width=0.5, jitter.width=0.1)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(color="black", angle=90, vjust=0.5, hjust=1, size=6),
+          legend.position="bottom")
+  return(p)
+}
+
+plot_qc_barplot <- function(x, aes_x, aes_y, aes_fill) {
+  p <- ggplot(s, aes(x=reorder({{aes_x}}, {{aes_y}}), y={{aes_y}}, fill={{aes_fill}})) +  
+    geom_bar(stat="identity") + 
+    theme_bw() +
+    theme(axis.text.x = element_text(color="black", angle=90, vjust=0.5, hjust=1, size=6),
+          legend.position="bottom")
+}
+
+
+s <- samples
+w <- 10
+h <- 8
+
+# total counts
+p <- plot_qc_boxplot(s, study, tot_counts, smoking_status) +
+  labs(x="library", y="total counts")  
+f <- file.path(plot_dir, "qc_barplot_tot_counts")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+# sj counts
+p <- plot_qc_boxplot(s, study, tot_counts_sj, smoking_status) +
+  labs(x="library", y="total splice junction counts")  
+f <- file.path(plot_dir, "qc_barplot_tot_counts_sj")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+# total counts vs sj counts
+p <- ggplot(s, aes(x=tot_counts, y=tot_counts_sj, color=study)) +
+  geom_point(aes(group=study),
+             position=position_jitterdodge(jitter.width=0.25),
+             alpha=0.7) +
+  scale_color_manual(values = pals::cols25()) +
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", angle=90, vjust=0.5, hjust=1, size=6),
+        legend.position="bottom") + 
+  labs(x="total counts", y="splice junction counts")
+f <- file.path(plot_dir, "qc_scatter_tot_counts_vs_sj_counts_study")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+# rrna
+p <- plot_qc_boxplot(s, study, kraken2_te_rrna, smoking_status) +
+  labs(title="Percent Ribosomal Bases", subtitle="rRNA remaining",
+       x="Library", y="Frac rRNA")
+f <- file.path(plot_dir, "qc_boxplot_rrna")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+# pct intergenic
+p <- plot_qc_boxplot(s, study, picard_pct_intergenic_bases, smoking_status) +
+  labs(title="Percent Intergenic Bases", subtitle="indicates DNA contamination",
+       x="Library", y="Frac Intergenic")
+f <- file.path(plot_dir, "qc_boxplot_intergenic")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+# frac MT counts
+p <- plot_qc_boxplot(s, study, mt_frac, smoking_status) +
+  labs(title="Frac MT", subtitle="measure of RNA degradation",
+       x="Study", y="Frac MT Counts")
+f <- file.path(plot_dir, "qc_boxplot_frac_mt_counts")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+# non-human RNA
+p <- plot_qc_boxplot(s, study, 100-kraken2_path_eukaryota, smoking_status) +
+  labs(title="Non-human RNA", subtitle="Assess contamination",
+       x="Study", y="%")
+f <- file.path(plot_dir, "qc_boxplot_pct_nonhuman")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+# other metrics
+p <- plot_qc_boxplot(s, aes_x=study, aes_y=low_expr_frac, aes_fill=smoking_status) +
+  labs(title="% Undetectable Genes", subtitle="Low expression",
+       x="Study", y="frac")
+f <- file.path(plot_dir, "qc_boxplot_low_expr_frac")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+p <- plot_qc_boxplot(s, aes_x=study, aes_y=complexity, aes_fill=smoking_status) +
+  labs(title="Library complexity", subtitle="Unique counts per sample",
+       x="Study", y="Frac")
+f <- file.path(plot_dir, "qc_boxplot_complexity")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+p <- plot_qc_barplot(s, aes_x=study, aes_y=complexity_sj, aes_fill=smoking_status) +
+  labs(title="Library SJ complexity", subtitle="Unique counts per sample",
+       x="Study", y="Frac")
+f <- file.path(plot_dir, "qc_boxplot_complexity_sj")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+p <- ggplot(s, aes(x=picard_pct_intergenic_bases, y=frac_counts_sj, color=study)) +
+  geom_point(size=2, alpha=1) +
+  scale_color_manual(values = pals::cols25()) +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  labs(title="Intergenic reads vs SJ reads", 
+       subtitle="indicates DNA vs RNA content",
+       x="frac intergenic", y="frac SJ")
+f <- file.path(plot_dir, "qc_scatter_intergenic_vs_sj")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+p <- ggplot(s, aes(x=tot_counts_sj, y=low_expr_frac_sj, color=study)) +
+  geom_point(size=2, alpha=0.8) +
+  scale_color_manual(values = pals::cols25()) +
+  geom_vline(xintercept = sample_min_counts_sj, linetype = "dashed", color = "red") +
+  scale_x_log10() +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  labs(title="Total SJ counts (x) vs Low Expression Frac (y)")
+f <- file.path(plot_dir, "qc_scatter_tot_sj_vs_low_sj")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+p <- ggplot(s, aes(x=tot_counts_sj, y=frac_counts_sj, color=study)) +
+  geom_point(size=2, alpha=0.8) +
+  scale_color_manual(values = pals::cols25()) +
+  scale_x_log10() +
+  theme_bw() +
+  labs(title="Total vs frac SJ", x="Total SJ", y="Frac SJ")
+f <- file.path(plot_dir, "qc_boxplot_frac_sj_counts")
+ggsave(paste0(f, ".pdf"), p, width=w, height=h)
+ggsave(paste0(f, ".png"), p, width=w, height=h)
+
+```
+
+
+# Make Cohorts
+
+```{r ad smoking blood cohorts, include=FALSE}
+
+make_cohort <- function(s, y, meta) {
+  keep <- filter_expr_group(y, gene_min_counts, min.prop=gene_min_prop, min.samples=gene_min_samples)
+  meta <- meta[keep,]
+  y <- y[keep,]
+
+  # merge redundant gene symbols 
+  meta <- merge_to_gene_symbol(meta, y)
+  y <- y[meta$gene_id,]
+  # sanity check
+  stopifnot(all(rownames(y) == meta$gene_id))
+  # convert to gene symbols
+  rownames(y) <- meta$gene_name
+  stopifnot(all(rownames(y) == meta$gene_name))
+  
+  # normalize gene counts
+  dge <- DGEList(counts = y, samples = s, genes = meta)
+  dge <- calcNormFactors(dge, norm_method)
+  ncpm <- cpm(dge, normalized.lib.sizes=TRUE)
+
+  cohort <- list()
+  cohort$s <- s
+  cohort$meta <- meta
+  cohort$counts <- y
+  cohort$log2_ncpm <- log2(ncpm + log2_pseudocount)
+  return(cohort)
+}
+
+# all samples
+# sj_all_cohort <- make_cohort(samples, sjm, gene_meta)
+
+# ad blood cohort
+s <- samples %>% filter(study == "ad_smoking", tissue == "blood")
+ad_blood_cohort <- make_cohort(s, gm[, s$library], gene_meta)
+
+# ad sputum cohort
+s <- samples %>% filter(study == "ad_smoking", tissue == "sputum")
+ad_sputum_cohort <- make_cohort(s, gm[, s$library], gene_meta)
+
+# st blood cohort (use splice junctions given discrepancies in data)
+s <- samples %>% filter(study == "st_smoking", tissue == "blood")
+st_blood_cohort <- make_cohort(s, sjm[, s$library], gene_meta)
+
+cohorts <- list()
+cohorts$ad_blood <- ad_blood_cohort
+cohorts$ad_sputum <- ad_sputum_cohort
+cohorts$st_blood <- st_blood_cohort
+
+```
+
+# Highly variable genes
+
+```{r highly variable genes}
+
+most_var_genes <- function(x, ntop=500, span=0.50) {
+  tbl <- bind_cols(
+    u = rowMeans(x),
+    v = apply(x, 1, function(x) var(x))
+  )
+  lovar <- loess(v ~ u, data=tbl, span=span)
+  tbl$lovar <- predict(lovar)
+  tbl$vadj <- abs(tbl$v / tbl$lovar)
+  keep <- order(tbl$vadj, decreasing=TRUE)[seq_len(min(ntop, nrow(tbl)))]
+  return(x[keep,])
+}
+
+ntop <- 250
+nlabel <- 50
+myspan <- 0.5
+
+for (cohort_name in names(cohorts)) {
+  print(cohort_name)
+  cohort = cohorts[[cohort_name]]
+  y <- cohort$log2_ncpm
+  
+  # plot most variable genes
+  tbl <- bind_cols(
+    g = rownames(y),
+    u = rowMeans(y),
+    v = apply(y, 1, function(x) var(x))
+  )
+  lovar <- loess(v ~ u, data=tbl, span=myspan)
+  tbl$lovar <- predict(lovar)
+  tbl$vadj <- abs(tbl$v / tbl$lovar)
+  tbl <- tbl %>% 
+    mutate(rank = min_rank(-vadj)) %>%
+    arrange(rank)
+  label_data <- filter(tbl, rank <= nlabel)
+  
+  p <- ggplot(tbl) +
+    geom_point(aes(u, v), alpha=0.5, color="#ffaaaa") +
+    geom_line(aes(u, lovar), color="blue") +
+    geom_text_repel(data=label_data, aes(u, v, label=g), color="black", 
+                    size=3, max.overlaps=Inf) +
+    theme_minimal()
+  f <- file.path(plot_dir, paste0("maplot_", cohort_name))
+  ggsave(paste0(f, ".pdf"), plot=p, width=10, height=10)
+  ggsave(paste0(f, ".png"), plot=p, width=10, height=10)  
+}
+
+
+```
+
+# PCA analysis
+
+```{r pca}
+
+ntop <- 25
+width=5
+height=4
+
+for (cohort_name in names(cohorts)) {
+  print(cohort_name)
+  cohort <- cohorts[[cohort_name]]
+  # gene counts
+  s <- cohort$s
+  y <- cohort$log2_ncpm
+
+  # run pca
+  res.pca <- prcomp(t(y), center=TRUE, scale.=TRUE)
+  res.pca_var <- round(100 * res.pca$sdev^2 / sum( res.pca$sdev^2 ), 2)
+  res.pca_var_txt <- paste(colnames(res.pca$x), " (", paste(as.character(res.pca_var), "%", ")", sep=""), sep="")
+  
+  # percent variance of each PC
+  p <- fviz_eig(res.pca, col.var="blue")
+  f <- file.path(plot_dir, paste0("pca_fviz_eig_", cohort_name, ".pdf"))
+  ggsave(f, p)
+  
+  # contributions of variables to PC1 and PC2
+  p <- fviz_contrib(res.pca, choice="var", axes = 1:2, top=50) +
+    theme(axis.text.x = element_text(angle=90))
+  f <- file.path(plot_dir, paste0("pca_fviz_contrib_", cohort_name, ".pdf"))
+  ggsave(f, p)
+  
+  # graph of variables contributing to PCA
+  p <- fviz_pca_var(
+    res.pca,
+    col.var = "contrib", # Color by the quality of representation
+    gradient.cols = c("darkorchid4", "gold", "darkorange"),
+    repel=TRUE,
+    select.var = list(contrib=ntop)
+  )
+  f <- file.path(plot_dir, paste0("pca_fviz_pca_var_", cohort_name, ".pdf"))
+  ggsave(f, p, width=10, height=10)
+  
+  # PCA plots
+  x <- bind_cols(s, as_tibble(res.pca$x))
+  
+  # smoking type
+  p <- ggplot(x, aes(x=PC1, y=PC2, color=smoking_type)) +
+    geom_point(alpha = 0.8, size=3) +
+    scale_color_manual(values = color_scales$smoking_type) +
+    theme_bw() +
+    labs(x=res.pca_var_txt[1], y=res.pca_var_txt[2])
+  
+  f <- file.path(plot_dir, paste0("pca_", cohort_name, "_smoking_type.pdf"))
+  ggsave(f, plot=p, device="pdf", width=width, height=height)
+
+}
+
+
+```
+
+
+# DE analysis
+
+```{r de analysis, include=FALSE}
+
+run_limma_trend <- function(y, design, contrasts, padj_cutoff, log2fc_cutoff) {
+  fit <- lmFit(y, design)
+  fit <- contrasts.fit(fit, contrasts)
+  fit <- eBayes(fit, trend=TRUE)
+
+  x <- NULL
+  for (coef in colnames(contrasts)) {
+    res <- topTable(fit, coef=coef, number=Inf, sort.by="none")
+    res <- as_tibble(res, rownames="gene")
+    res <- res %>%
+      select(gene,
+             log2fc=logFC,
+             avgexpr=AveExpr,
+             pval=P.Value,
+             padj=adj.P.Val) %>%
+      mutate(de = case_when(padj > padj_cutoff ~ "no",
+                            log2fc < -log2fc_cutoff ~ "dn",
+                            log2fc > log2fc_cutoff ~ "up",
+                            TRUE ~ "no"),
+             contrast = coef)
+    x <- bind_rows(x, res)
+  }
+  return(x)
+}
+
+#
+# DE analysis 
+#
+de <- NULL
+for (cohort_name in names(cohorts)) {
+  print(cohort_name)
+  cohort <- cohorts[[cohort_name]]
+  s <- cohort$s
+  y <- cohort$log2_ncpm
+
+  # add categories
+  s <- s %>% mutate(
+    patient = factor(patient),
+    smoking_type = factor(smoking_type)
+  )
+
+  # smoking type
+  design <- model.matrix(~0 + smoking_type, s)
+  contrasts <- makeContrasts(cig_vs_control = smoking_typecigarette - smoking_typecontrol,
+                             cig_vs_ecig = smoking_typecigarette - smoking_typeecigarette,
+                             ecig_vs_control = smoking_typeecigarette - smoking_typecontrol,
+                             levels=design)
+  res <- run_limma_trend(y, design, contrasts, 
+                         padj_cutoff=de_padj_cutoff, 
+                         log2fc_cutoff=de_log2fc_cutoff)
+  res$cohort <- cohort_name
+  table(res$contrast, res$de)
+  de <- bind_rows(de, res)  
+}
+
+
+# write results
+table(de$cohort, de$contrast, de$de)
+write_xlsx(de, file.path(results_dir, "human_smoking_study_de_results.xlsx"))
+
+# merged de analyses
+de_merged <- de %>% select(gene, cohort, contrast, log2fc, pval, padj, de) %>%
+  pivot_wider(names_from = contrast, values_from = c(log2fc, pval, padj, de))
+
+```
+
+# DE Plots
+
+```{r de plots, include=FALSE}
+
+plot_de_volcano <- function(res, nlabel=25, 
+                            highlight_genes=NULL, 
+                            label_genes=NULL,
+                            padj_threshold=1e-10,
+                            log2fc_threshold=1,
+                            log_base=10) {
+  # select the top n up/down genes that meet thresholds for DE for labeling
+  de_up <- filter(res, de == "up") %>% slice_max(log2fc, n=nlabel)
+  de_dn <- filter(res, de == "dn") %>% slice_min(log2fc, n=nlabel)
+  # label highlighted genes that are also DE
+  highlight_data <- filter(res, gene %in% highlight_genes)
+  highlight_de_up <- filter(highlight_data, de=="up")
+  highlight_de_dn <- filter(highlight_data, de=="dn")
+  highlight_data <- distinct(highlight_data)
+  # start with specifically labeled genes
+  label_data <- filter(res, gene %in% label_genes)
+  # add on top up/dn de as well as highlighted de genes
+  label_data <- bind_rows(label_data, de_up, de_dn, highlight_de_up, highlight_de_dn)
+  label_data <- distinct(label_data)
+
+  p <- ggplot(res, aes(x=log2fc, y=-log(pval, log_base), color=de)) +
+    geom_point(size=1, alpha=0.7) +
+    geom_point(data=highlight_data, size=2, alpha=1, color="purple", pch=21, stroke=2) +
+    geom_text_repel(data=label_data, color="black", size=3, aes(label=gene), max.overlaps=Inf) +
+    scale_color_manual(values=c("no"="grey", "dn"="blue", "up"="red")) +
+    scale_size_manual(values=c("no"=1, "dn"=2, "up"=2)) +
+    theme_minimal() +
+    theme(legend.position="bottom") +
+    theme(axis.line = element_line(color = "black")) +
+    labs(x="log2fc", y=paste0("-log(pval,", log_base, ")"))
+  return(p)
+}
+
+for (cohort_name in names(cohorts)) {
+  print(cohort_name)
+  de_cohort <- dplyr::filter(de, cohort == cohort_name)
+  for (mycontrast in unique(de_cohort$contrast)) {
+    print(mycontrast)
+    x <- dplyr::filter(de_cohort, contrast == mycontrast)
+    print(dim(x))
+    mysubtitle <- paste0("Cohort ", cohort_name, " Contrast ", mycontrast)
+    p <- plot_de_volcano(x, label_genes = ahr_literature_genes,
+                         highlight_genes = ahr_opitz_cell_human_genes) + 
+      labs(title="Volcano Plot", subtitle=mysubtitle)
+    filename <- paste0(cohort_name, "_", mycontrast)
+    f <- paste0("volcano_de_", filename, ".pdf")
+    ggsave(file.path(plot_dir, f), p, width=8, height=8)
+    f <- paste0("volcano_de_", filename, ".png")
+    ggsave(file.path(plot_dir, f), p, width=8, height=8)
+  }
+}
+
+
+```
+
+# Gene plots
+
+```{r gene plots, include=FALSE}
+
+plot_gene <- function(s, x, gene, aes_x, aes_color) {
+  exprs <- unlist(x[gene, ])
+  x <- s %>% add_column(gene = exprs)
+  p <- ggplot(x, aes(x={{aes_x}}, y=gene, fill={{aes_color}})) +
+    geom_boxplot(outlier.shape=NA, width=0.75) +
+    geom_point(position=position_jitterdodge(jitter.width=0.1), 
+               aes(group={{aes_color}}), pch=21) +
+    ggtitle(paste0("Gene: ", gene)) +
+    theme_bw() + 
+    theme(axis.text.x = element_text(color = "black", angle = 90, vjust = 0.5, hjust=1)) +
+    theme(axis.line = element_line(color = "black")) +
+    theme(legend.position="bottom")
+  return(p)
+}
+
+genes <- de %>% filter(de != "no") %>% distinct(gene)
+
+g <- "CYP1B1"
+genes <- ahr_literature_genes
+
+
+for (g in genes) {
+  p <- list()
+  num_plots <- 0
+  for (cohort_name in names(cohorts)) {
+    cohort <- cohorts[[cohort_name]]
+    s <- cohort$s
+    y <- cohort$log2_ncpm
+    if (!(g %in% rownames(y))) next
+    p[[cohort_name]] <- plot_gene(s, y, g, smoking_type, smoking_type) + 
+      scale_fill_manual(values = color_scales$smoking_type) + 
+      labs(title=paste0("Gene: ", g), 
+           subtitle=paste0("Cohort: ", cohort_name),
+           x="Smoking Type", y="log2 norm CPM")
+    num_plots <- num_plots + 1
+  }
+  p <- p$ad_sputum + p$ad_blood + p$st_blood
+  f <- file.path(plot_dir, paste0("gene_boxplot_", g))
+  ggsave(paste0(f, ".pdf"), p, width=1+(2*num_plots), height=4)
+  ggsave(paste0(f, ".png"), p, width=1+(2*num_plots), height=4)
+}
+
+
+```
+
+
+# GSEA
+
+```{r gsea, include=FALSE}
+
+get_de_ranks <- function(de, a) {
+  ranks <- de %>% 
+    dplyr::filter(contrast == a) %>%
+    select(gene, log2fc, padj) %>%
+    mutate(rank = log2fc)
+  ranks = sort(setNames(ranks$rank, ranks$gene), decreasing = TRUE)
+  return(ranks)
+}
+
+plot_gsea_enrichment <- function(x, ranks, a, gs) {
+  txt_stat <- paste0("ES=", round(x$ES,2), " NES=", round(x$NES, 2), " padj=", format(x$padj, scientific=TRUE, digits=3))
+  txt_title <- paste0("ranks: ", a, " gs: ", x$pathway)
+  p <- plotEnrichment(gs[[x$pathway]], ranks) +
+    annotate(geom="text", x=150, y=0.1, label=txt_stat, hjust=0) +
+    labs(title = txt_title, 
+         xlab = "Rank",
+         ylab = "Enrichment Score") +
+    theme(plot.title = element_text(size=8))
+  return(p)
+}
+
+run_batch_fgsea <- function(my_contrasts, my_de, my_gs, my_prefix, 
+                            my_plot_dir, 
+                            my_padj_cutoff=0.01,
+                            do_plots=TRUE) {
+  gsea <- NULL
+  for (a in my_contrasts) {
+    ranks <- get_de_ranks(my_de, a)
+    #res <- fgseaSimple(pathways = my_gs, stats = ranks, nperm=10000)
+    res <- fgsea(pathways=my_gs, stats=ranks, minSize=10, eps=0, nPermSimple=10000)
+    res <- mutate(res, analysis = a)
+    gsea <- bind_rows(gsea, res)
+    print(a)
+    if (do_plots) {
+      for (i in 1:nrow(res)) {
+        x <- res[i,]
+        if (is.na(x$padj) | (x$padj >= my_padj_cutoff)) { next }
+        print(x$pathway)
+        p <- plot_gsea_enrichment(x, ranks, a, my_gs)
+        f <- file.path(my_plot_dir, paste0("gsea_", my_prefix, "_", a, "_gs_", x$pathway, ".pdf"))
+        ggsave(f, plot=p, device="pdf", width=5, height=3)
+      }
+    }
+  }
+  return(gsea)
+}
+
+
+# gene sets
+gs <- orthotopic_tcdd_gs
+gs$OPITZ_AHR_SIGNATURE <- ahr_opitz_cell_human_genes
+
+gsea <- NULL
+for (cohort_name in names(cohorts)) {
+  x <- de %>% filter(cohort == cohort_name)
+  res <- run_batch_fgsea(unique(x$contrast), x, gs, cohort_name, plot_dir)
+  res$cohort <- cohort_name
+  gsea <- bind_rows(gsea, res)
+}
+
+# write gsea results
+f <- file.path(results_dir, "ahr_gsea_results.tsv")
+data.table::fwrite(gsea, file=f, sep="\t", sep2=c("", " ", ""))
+f <- file.path(results_dir, "ahr_gsea_results.xlsx")
+write_xlsx(gsea, f)
+
+
+```
+
+
+## GSEA plots
+
+```{r gsea plots}
+
+plot_gsea_volcano <- function(x, padj_cutoff = 0.01, max.overlaps = Inf) {
+  p <- ggplot(x, aes(x=NES, y=-log10(padj), color=analysis)) + 
+    geom_point(data=subset(x, padj > padj_cutoff), size=1, alpha=0.4) + 
+    geom_point(data=subset(x, padj <= padj_cutoff), size=2, alpha=0.8) +
+    geom_text_repel(data=subset(x, padj <= padj_cutoff), color="black", size=3, aes(label=pathway), max.overlaps=max.overlaps) +
+    ylab("-log10(adjusted p-value)") +
+    xlab("NES") +
+    theme_minimal() +
+    theme(legend.position="bottom") + 
+    theme(axis.line = element_line(color = "black")) +
+    coord_flip() 
+  return(p)
+}
+
+plot_gsea_barplot <- function(x, padj_cutoff = 0.01) {
+  x <- mutate(x, sig = ifelse(padj < padj_cutoff, ifelse(NES < 0, "dn", "up"), "no"),
+              neglog10padj = ifelse(padj < padj_cutoff, -log10(padj), NA))
+  p <- ggplot(x, aes(x=reorder(pathway, NES), y=NES, fill=neglog10padj)) +
+    geom_col() +
+    scale_fill_viridis_c() +
+    #scale_fill_gradient(low = "blue", high = "cyan", na.value="#aaaaaa") +
+    coord_flip() +
+    labs(x="Analysis", y="Normalized Enrichment Score") +
+    theme_minimal()
+  return(p)
+}
+
+plot_gsea_pathway <- function(x, padj_cutoff = 0.01) {
+  x <- mutate(x, sig = ifelse(padj < padj_cutoff, ifelse(NES < 0, "dn", "up"), "no"),
+              neglog10padj = ifelse(padj < padj_cutoff, -log10(padj), NA))
+  mytitle <- x %>% select(pathway) %>% slice_head(n=1)
+  p <- ggplot(x, aes(x=reorder(analysis, NES), y=NES, fill=neglog10padj)) +
+    geom_col() +
+    theme_minimal() +
+    theme(axis.text.x = element_text(color = "black", angle = 90, vjust = 0.5, hjust=1)) +
+    theme(axis.line = element_line(color = "black")) +   
+    labs(title=mytitle, x="Analysis", y="Normalized Enrichment Score")
+  return(p)
+}
+
+
+p <- plot_gsea_barplot(gsea, padj_cutoff=0.01) + 
+  theme(axis.text.y = element_text(size=6)) +
+  facet_grid(analysis ~ cohort)
+f <- file.path(plot_dir, paste0("gsea_barplot_grid.pdf"))
+ggsave(f, plot=p, width=10, height=4)
+
+```
+
